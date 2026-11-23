@@ -21,15 +21,20 @@ U32 = (1 << 32) - 1
 WAVE = (1 << 64) - 1
 
 # ESVertCount and GSPrimCount of each wave in a modeled subgroup: a single triangle,
-# one vertex, partial and full waves, a wave without primitives and a third wave.
+# one vertex, partial and full waves, waves without primitives or without vertices
+# and a third wave.
 SUBGROUPS = (
     ((3, 1),),
     ((1, 1),),
     ((17, 5),),
     ((64, 64),),
     ((64, 30), (6, 0)),
+    ((64, 64), (0, 36)),
     ((64, 64), (64, 64), (40, 20)),
 )
+# Primitive input layouts. In pass-through mode v0 holds the packed export value; otherwise
+# v0 and v1 hold 16-bit vertex indices that the shader packs itself.
+LAYOUTS = ("pass-through", "16-bit indices")
 
 # Source width, destination width, result and whether SCC is the result's non-zero test.
 SCALAR_ALU = {
@@ -38,6 +43,7 @@ SCALAR_ALU = {
     "s_or_b32": (32, 32, lambda a, b: a | b, True),
     "s_lshl_b32": (32, 32, lambda a, b: a << (b & 31) & U32, True),
     "s_bfe_u32": (32, 32, lambda a, b: a >> (b & 31) & (1 << (b >> 16 & 127)) - 1, True),
+    "s_bfm_b64": (32, 64, lambda a, b: ((1 << (a & 63)) - 1) << (b & 63) & WAVE, False),
 }
 SCALAR_COMPARE = {
     "s_cmp_eq_u32": lambda a, b: a == b,
@@ -50,6 +56,7 @@ VECTOR_ALU = {
 }
 VECTOR_COMPARE = {
     "v_cmp_gt_u32_e32": lambda a, b: a > b,
+    "v_cmpx_gt_u32_e32": lambda a, b: a > b,
 }
 EXPORT = re.compile(r"(prim|pos0|param\d+) (v\d+|off), (v\d+|off), (v\d+|off), (v\d+|off)((?: [a-z]+)*)")
 FLOAT_INLINE = {
@@ -94,14 +101,29 @@ def f32_bits(number):
 # expressions. Floating-point results are always expressions, evaluated by DXC.
 INTEGER = {
     "v_lshlrev_b32_e32": (lambda a, b: b << (a & 31) & U32, lambda a, b: f"({as_uint(b)} << {amount(a)})"),
+    "v_lshrrev_b32_e32": (lambda a, b: b >> (a & 31), lambda a, b: f"({as_uint(b)} >> {amount(a)})"),
     "v_and_b32_e32": (lambda a, b: a & b, lambda a, b: f"({as_uint(a)} & {as_uint(b)})"),
+    "v_bfe_u32": (lambda a, b, c: a >> (b & 31) & (1 << (c & 31)) - 1,
+                  lambda a, b, c: f"(({as_uint(a)} >> {amount(b)}) & ((1u << {amount(c)}) - 1u))"),
+    "v_lshl_or_b32": (lambda a, b, c: (a << (b & 31) | c) & U32,
+                      lambda a, b, c: f"(({as_uint(a)} << {amount(b)}) | {as_uint(c)})"),
 }
 CONVERT = {
     "v_cvt_f32_u32_e32": (lambda a: float(a), lambda a: f"float({as_uint(a)})"),
+    "v_cvt_f32_i32_e32": (lambda a: float(a - (a >> 31 << 32)), lambda a: f"float(asint({as_uint(a)}))"),
 }
+# v_fmac_f32 reads its destination as the third operand.
 FLOAT = {
     "v_fma_f32": lambda a, b, c: f"mad({as_float(a)}, {as_float(b)}, {as_float(c)})",
+    "v_fmac_f32_e32": lambda a, b, c: f"mad({as_float(a)}, {as_float(b)}, {as_float(c)})",
+    "v_mul_f32_e32": lambda a, b: f"({as_float(a)} * {as_float(b)})",
+    "v_add_f32_e32": lambda a, b: f"({as_float(a)} + {as_float(b)})",
+    "v_sub_f32_e32": lambda a, b: f"({as_float(a)} - {as_float(b)})",
 }
+
+
+class PrimitiveMismatch(ValueError):
+    """The primitive export differs from the input primitive in the modeled layout."""
 
 
 class Expressions:
@@ -147,14 +169,16 @@ def pair(token):
     return int(m[1])
 
 
-def subgroup(waves):
+def subgroup(waves, layout):
     """Entry SGPRs and per-lane VGPRs of each wave in one modeled subgroup.
 
     s2 (gs_tg_info) holds the subgroup's vertex count in bits 20:12 and primitive
     count in bits 30:22. s3 (merged_wave_info) holds the wave's ESVertCount in bits
     7:0, GSPrimCount in bits 15:8, its index in bits 27:24 and the wave count in bits
     31:28. A primitive thread receives its three vertex indices packed ten bits apart
-    in v0. Lanes without a primitive hold distinct values that no check accepts.
+    in v0 in pass-through mode, or as 16-bit halves of v0 and v1 otherwise. Either way
+    it must export the packed value. Lanes without a primitive hold distinct values
+    that no check accepts.
     VertexID (v5) is the symbolic input of the translated shader in every lane.
     """
     vertices = sum(es for es, _ in waves)
@@ -170,11 +194,14 @@ def subgroup(waves):
             if lane < gs:
                 p = first + lane
                 indices = [(3 * p + 7 * k + 1) % vertices for k in range(3)]
-                v0 = indices[0] | indices[1] << 10 | indices[2] << 20
-                expected[lane] = v0
+                expected[lane] = indices[0] | indices[1] << 10 | indices[2] << 20
+                if layout == "pass-through":
+                    v0, v1 = expected[lane], 0xB1000000 | index << 8 | lane
+                else:
+                    v0, v1 = indices[0] | indices[1] << 16, indices[2] | (indices[0] + 1) % vertices << 16
             else:
-                v0 = 0xDEA00000 | index << 8 | lane
-            lanes.append({0: v0, 1: 0xB1000000 | index << 8 | lane, 5: VERTEX_ID})
+                v0, v1 = 0xDEA00000 | index << 8 | lane, 0xB1000000 | index << 8 | lane
+            lanes.append({0: v0, 1: v1, 5: VERTEX_ID})
         result.append(({2: s2, 3: s3}, lanes, expected, es))
         first += gs
     return vertices, primitives, result
@@ -251,8 +278,9 @@ class Wave:
 
     def vector_op(self, op, args):
         if op in VECTOR_COMPARE:
-            dest, a, b = args
-            if dest != "vcc":
+            # A gfx10 v_cmpx writes EXEC only.
+            dest, a, b = ("exec", *args) if op.startswith("v_cmpx_") else args
+            if dest not in ("vcc", "exec"):
                 raise ValueError(f"Unsupported comparison destination {dest}")
             mask = 0
             for lane in self.live():
@@ -260,13 +288,15 @@ class Wave:
                 if type(x) is not int or type(y) is not int:
                     raise ValueError("Per-vertex value in a predicate")
                 mask |= VECTOR_COMPARE[op](x, y) << lane
-            self.vcc = mask
+            self.put(dest, mask, 64)
             return
         if op != "v_mov_b32_e32" and not any(op in table for table in (VECTOR_ALU, INTEGER, CONVERT, FLOAT)):
             raise ValueError(f"Unsupported vertex instruction {op}")
         dest, *sources = args
         if not re.fullmatch(r"v\d+", dest):
             raise ValueError(f"Unsupported vector destination {dest}")
+        if op == "v_fmac_f32_e32":
+            sources.append(dest)
         for lane in self.live():
             values = [self.lane_value(t, lane) for t in sources]
             self.v[lane][int(dest[1:])] = self.lane_result(op, lane, values)
@@ -316,6 +346,12 @@ class Wave:
             a, b = (self.scalar(t) for t in args)
             self.scc = SCALAR_COMPARE[op](a, b)
             return
+        if op == "s_cmov_b64":
+            if self.scc is None:
+                raise ValueError("Undefined scalar predicate")
+            if self.scc:
+                self.put(args[0], self.scalar(args[1], 64), 64)
+            return
         if op == "s_and_saveexec_b64":
             dest, source = args
             old = self.exec
@@ -341,6 +377,8 @@ class Wave:
             if self.scc is None:
                 raise ValueError("Undefined scalar predicate")
             taken = self.scc
+        elif op == "s_cbranch_execz":
+            taken = self.exec == 0
         else:
             raise ValueError(f"Unsupported vertex instruction {op}")
         return index[target] if taken else None
@@ -377,9 +415,9 @@ class Wave:
                 raise ValueError(f"Unsupported vertex instruction {op}")
 
 
-def check_subgroup(program, waves, expressions):
+def check_subgroup(program, waves, layout, expressions):
     """Run one modeled subgroup and check its synchronization, allocation and export lanes."""
-    vertices, primitives, entries = subgroup(waves)
+    vertices, primitives, entries = subgroup(waves, layout)
     results = []
     for index, (sgprs, lanes, _, _) in enumerate(entries):
         wave = Wave(index, sgprs, lanes, expressions)
@@ -397,7 +435,7 @@ def check_subgroup(program, waves, expressions):
         if primitive.keys() != expected.keys():
             raise ValueError("Primitive export lanes differ from the input primitives")
         if any(primitive[lane][0] != value for lane, value in expected.items()):
-            raise ValueError("Primitive export differs from the input primitive")
+            raise PrimitiveMismatch("Primitive export differs from the input primitive")
         if wave.exports.get("pos0", {}).keys() != set(range(wave_vertices)):
             raise ValueError("Position export lanes differ from the input vertices")
     return results
@@ -430,18 +468,26 @@ def lower(program):
     """Return HLSL for a decoded NGG vertex program given as (byte offset, text) pairs."""
     if not program or program[-1][1] != "s_endpgm" or [line for _, line in program].count("s_endpgm") != 1:
         raise ValueError("Expected a single trailing s_endpgm")
-    expressions = Expressions()
-    waves = [wave for shape in SUBGROUPS for wave in check_subgroup(program, shape, expressions)]
+    # The layout is a pipeline setting, so a program that packs the primitive itself is
+    # checked against 16-bit indices and one that forwards v0 against pass-through input.
+    for layout in LAYOUTS:
+        expressions = Expressions()
+        try:
+            waves = [wave for shape in SUBGROUPS for wave in check_subgroup(program, shape, layout, expressions)]
+            break
+        except PrimitiveMismatch:
+            if layout == LAYOUTS[-1]:
+                raise
     # Every vertex thread of every subgroup must compute the same function of VertexID.
-    positions = {value for wave in waves for value in wave.exports["pos0"].values()}
+    positions = {value for wave in waves for value in wave.exports.get("pos0", {}).values()}
     if len(positions) != 1:
         raise ValueError("Position depends on more than VertexID")
     targets = {target for wave in waves for target in wave.exports if target.startswith("param")}
     parameters = {}
     for k in sorted(int(target[5:]) for target in targets):
-        if any(wave.exports.get(f"param{k}", {}).keys() != wave.exports["pos0"].keys() for wave in waves):
+        if any(wave.exports.get(f"param{k}", {}).keys() != wave.exports.get("pos0", {}).keys() for wave in waves):
             raise ValueError(f"param{k} export lanes differ from the input vertices")
-        values = {value for wave in waves for value in wave.exports[f"param{k}"].values()}
+        values = {value for wave in waves for value in wave.exports.get(f"param{k}", {}).values()}
         if len(values) != 1:
             raise ValueError(f"param{k} depends on more than VertexID")
         parameters[k] = values.pop()

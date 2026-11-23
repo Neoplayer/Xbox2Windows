@@ -5,7 +5,7 @@ import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from vertex_aot import lower
+from vertex_aot import LAYOUTS, SUBGROUPS, Expressions, PrimitiveMismatch, check_subgroup, lower
 
 # Wave 0 allocates the subgroup's input counts after a barrier that every wave passes.
 PROLOGUE = [
@@ -66,6 +66,71 @@ VertexOutput main(uint vertex_id : SV_VertexID) {
   return result;
 }
 """
+# The same triangle from a program that packs 16-bit input indices itself and sets EXEC
+# the way LLVM does for merged shaders: s_bfm_b64 cannot express 64 lanes, so a full
+# wave takes the s_cmov_b64 path. A wave without vertices skips to the end.
+PACKED_PRIMITIVE = [
+    "s_bfe_u32 s5, s3, 0x80008",
+    "s_bfm_b64 exec, s5, 0",
+    "s_cmp_eq_u32 s5, 64",
+    "s_cmov_b64 exec, -1",
+    "v_bfe_u32 v20, v0, 16, 16",
+    "v_and_b32_e32 v21, 0xffff, v0",
+    "v_and_b32_e32 v22, 0xffff, v1",
+    "v_lshl_or_b32 v23, v20, 10, v21",
+    "v_lshl_or_b32 v23, v22, 20, v23",
+    "exp prim v23, off, off, off done",
+    "s_mov_b64 exec, -1",
+]
+PACKED_VERTEX = [
+    "v_mbcnt_lo_u32_b32 v9, -1, 0",
+    "v_mbcnt_hi_u32_b32 v9, -1, v9",
+    "s_and_b32 s5, s3, 0xff",
+    "v_cmpx_gt_u32_e32 s5, v9",
+    "s_cbranch_execz 18",
+    "v_and_b32_e32 v10, 1, v5",
+    "v_lshrrev_b32_e32 v11, 1, v5",
+    "v_cvt_f32_u32_e32 v10, v10",
+    "v_cvt_f32_i32_e32 v11, v11",
+    "v_mov_b32_e32 v12, -1.0",
+    "v_fmac_f32_e32 v12, 4.0, v10",
+    "v_mul_f32_e32 v13, 4.0, v11",
+    "v_sub_f32_e32 v13, 1.0, v13",
+    "v_mov_b32_e32 v14, 0",
+    "v_mov_b32_e32 v15, 1.0",
+    "exp pos0 v12, v13, v14, v15 done",
+    "v_add_f32_e32 v10, v10, v10",
+    "v_add_f32_e32 v11, v11, v11",
+    "exp param0 v10, v11, v14, v15",
+    "exp param1 v11, off, v10, off",
+]
+PACKED_HLSL = """struct VertexOutput {
+  float4 position : SV_Position;
+  float4 attr0 : TEXCOORD0;
+  float4 attr1 : TEXCOORD1;
+};
+
+VertexOutput main(uint vertex_id : SV_VertexID) {
+  uint t0 = (0x1u & vertex_id);
+  uint t1 = (vertex_id >> 1u);
+  precise float t2 = float(t0);
+  precise float t3 = float(asint(t1));
+  precise float t4 = mad(asfloat(0x40800000u), t2, asfloat(0xbf800000u));
+  precise float t5 = (asfloat(0x40800000u) * t3);
+  precise float t6 = (asfloat(0x3f800000u) - t5);
+  precise float t7 = (t2 + t2);
+  precise float t8 = (t3 + t3);
+  VertexOutput result;
+  result.position = float4(t4, t6, asfloat(0x00000000u), asfloat(0x3f800000u));
+  result.attr0 = float4(t7, t8, asfloat(0x00000000u), asfloat(0x3f800000u));
+  result.attr1 = float4(t8, 0.0f, t7, 0.0f);
+  return result;
+}
+"""
+PASS_THROUGH = PROLOGUE + PRIMITIVE + VERTEX + ["s_endpgm"]
+# The barrier is a Navi1x workaround; the second program omits it.
+PACKED = PROLOGUE[1:] + PACKED_PRIMITIVE + PACKED_VERTEX + ["s_endpgm"]
+FIXTURES = ((PASS_THROUGH, FULLSCREEN_HLSL), (PACKED, PACKED_HLSL))
 VOP3 = {"v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_fma_f32", "v_bfe_u32", "v_lshl_or_b32"}
 SOPP = {"s_barrier", "s_branch", "s_cbranch_scc1", "s_cbranch_execz", "s_endpgm", "s_sendmsg"}
 
@@ -192,15 +257,52 @@ def parameter_controls():
     expect_error(program[:-1] + [export, "s_endpgm"], "Repeated param0 export")
 
 
+def packed_controls():
+    program = PACKED
+    for old, new in (("v_lshl_or_b32 v23, v20, 10, v21", "v_lshl_or_b32 v23, v20, 11, v21"),
+                     ("v_and_b32_e32 v22, 0xffff, v1", "v_bfe_u32 v22, v1, 16, 16"),
+                     ("exp prim v23, off, off, off done", "exp prim v21, off, off, off done")):
+        expect_error(replace(program, old, new), "Primitive export differs from the input primitive")
+    # Without the s_cmov_b64 path a full wave exports no primitive; without the comparison
+    # s_cmov_b64 reads the s_bfe_u32 SCC and every lane exports one.
+    expect_error([line for line in program if line not in ("s_cmp_eq_u32 s5, 64", "s_cmov_b64 exec, -1")],
+                 "Primitive export lanes differ from the input primitives")
+    expect_error([line for line in program if line != "s_cmp_eq_u32 s5, 64"],
+                 "Primitive export lanes differ from the input primitives")
+    expect_error(["s_cmov_b64 exec, -1"] + program, "Undefined scalar predicate")
+    expect_error(replace(program, "v_cmpx_gt_u32_e32 s5, v9", "v_cmpx_gt_u32_e32 s5, v5"),
+                 "Per-vertex value in a predicate")
+    expect_error(replace(program, "v_lshrrev_b32_e32 v11, 1, v5", "v_lshrrev_b32_e32 v11, 1, v1"),
+                 "Position depends on more than VertexID")
+
+
+def layout_controls():
+    """Each fixture reproduces the input primitive in its own layout only."""
+    for program, layout in ((PASS_THROUGH, LAYOUTS[0]), (PACKED, LAYOUTS[1])):
+        for other in LAYOUTS:
+            try:
+                for shape in SUBGROUPS:
+                    check_subgroup(decoded(program), shape, other, Expressions())
+            except PrimitiveMismatch:
+                if other == layout:
+                    raise
+            else:
+                if other != layout:
+                    raise AssertionError(f"Primitive export also matched the {other} layout")
+
+
 def source():
     prologue_controls()
     primitive_controls()
     position_controls()
     parameter_controls()
-    translated = lower(decoded(PROLOGUE + PRIMITIVE + VERTEX + ["s_endpgm"]))
-    if translated != FULLSCREEN_HLSL:
-        raise AssertionError(f"Unexpected HLSL:\n{translated}")
-    return translated
+    packed_controls()
+    layout_controls()
+    for program, expected in FIXTURES:
+        translated = lower(decoded(program))
+        if translated != expected:
+            raise AssertionError(f"Unexpected HLSL:\n{translated}")
+    return FIXTURES
 
 
 if __name__ == "__main__":
