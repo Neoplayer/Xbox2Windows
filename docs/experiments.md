@@ -2273,6 +2273,60 @@ reference index caused the comparison to fail. Tested on Windows build
 26200.9974, RTX 4060 Laptop driver 32.0.16.1656 and WARP 10.0.26100.9818,
 with the debug layer enabled.
 
+## NGG vertex shaders from VertexID
+
+`tools/vertex_aot.py` translates a stage 1 program that runs as the ES half of
+a gfx10 NGG primitive shader into a `vs_6_0` vertex shader. The entry layout
+follows Mesa 22.3 for gfx10 NGG without culling. `s2` holds the subgroup's
+vertex count in bits 20:12 and primitive count in bits 30:22. `s3` holds the
+wave's vertex count in bits 7:0, primitive count in bits 15:8 and index in
+bits 27:24. `v0` and `v1` hold the primitive input and `v5` holds VertexID.
+Whether package records use NGG, this layout and wave64 has not been checked;
+the translator rejects a program that does not fit.
+
+The translator runs each wave of seven modeled subgroups with concrete control
+registers and VertexID as a symbolic input. The subgroups range from a single
+triangle to three waves, and include a wave with primitives but no vertices.
+The prologue is accepted only if, in every subgroup:
+
+- every wave passes the same barriers, and wave 0 alone sends `GS_ALLOC_REQ`
+  with `m0 = vertices | primitives << 12` from `s2` before its first export;
+- each lane below the wave's primitive count exports `prim` with `done`, and
+  the value equals that lane's input primitive, forwarded from `v0` in
+  pass-through mode or packed from 16-bit indices in `v0` and `v1`;
+- each lane below the wave's vertex count exports `pos0` with `done` and the
+  same parameters, and no other lane exports either;
+- every exported position and parameter is the same expression of VertexID in
+  every lane and subgroup.
+
+Predicates and lane counts that depend on VertexID, backward branches, memory,
+LDS, user SGPRs, InstanceID (`v8`) and `pos1` to `pos4` are rejected. PARAM k
+becomes `TEXCOORD` k, the slot from which a translated pixel shader reads
+attribute k. The subgroup set is a finite check of the prologue, not a proof
+for every input. Edge flags and null primitives are clear in the modeled input.
+
+The two source-built fixtures draw the same full-screen triangle. One forwards
+the pass-through primitive after the Navi1x barrier. The other packs 16-bit
+indices and sets EXEC the way LLVM does for merged shaders, with `s_bfm_b64`
+and then `s_cmov_b64` for a full wave. The binary check requires LLVM 15's
+listing of each assembled fixture to equal its source, including byte offsets,
+and the command-line output to equal the source-mode HLSL. With Homebrew LLVM
+15.0.7 on macOS both fixtures matched, and the same code in pixel and mesh
+records was rejected as the wrong stage.
+
+The draw test renders each translated shader with `DrawInstanced(3, 1, 0, 0)`
+and no input layout into a 32×32 RGBA32F target. The pixel shader returns
+`TEXCOORD0`. The CPU reference is the texture coordinate at each pixel centre,
+`((x + 0.5) / 32, (y + 0.5) / 32, 0, 1)`, compared within 1/4096. Each fixture
+must match the reference and fail against its transpose. A variant whose
+`param0` swaps the coordinates must match only the transpose.
+
+```sh
+python3 -B tests/vertex_aot_check.py
+python3 -B tests/vertex_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^vertex_fullscreen_draw_" -V
+```
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The store profile translates one or more non-overlapping raw UAV stores of one to four known 32-bit constant words per invocation, including constants loaded via `s_mov_b32`, `s_movk_i32`, and `v_mov_b32` register copies, along with `s_clause` hints and combined `lgkmcnt(0)`/`vmcnt(0)` waits. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
