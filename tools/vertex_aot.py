@@ -10,6 +10,8 @@ assembler can replace it.
 
 import argparse
 import re
+import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 from pixel_aot import container_code, disassemble
@@ -56,6 +58,76 @@ FLOAT_INLINE = {
 }
 
 
+@dataclass(frozen=True)
+class Sym:
+    """A per-vertex value held in an HLSL variable of type uint or float."""
+
+    name: str
+    kind: str
+
+
+VERTEX_ID = Sym("vertex_id", "uint")
+
+
+def as_uint(value):
+    if isinstance(value, Sym):
+        return value.name if value.kind == "uint" else f"asuint({value.name})"
+    return f"{value:#x}u"
+
+
+def as_float(value):
+    if isinstance(value, Sym):
+        return value.name if value.kind == "float" else f"asfloat({value.name})"
+    return f"asfloat({value:#010x}u)"
+
+
+def amount(value):
+    """Shift operand: the hardware reads bits 4:0."""
+    return f"{value & 31}u" if type(value) is int else f"({as_uint(value)} & 31u)"
+
+
+def f32_bits(number):
+    return struct.unpack("<I", struct.pack("<f", number))[0]
+
+
+# Integer and conversion results fold for concrete operands and otherwise become
+# expressions. Floating-point results are always expressions, evaluated by DXC.
+INTEGER = {
+    "v_lshlrev_b32_e32": (lambda a, b: b << (a & 31) & U32, lambda a, b: f"({as_uint(b)} << {amount(a)})"),
+    "v_and_b32_e32": (lambda a, b: a & b, lambda a, b: f"({as_uint(a)} & {as_uint(b)})"),
+}
+CONVERT = {
+    "v_cvt_f32_u32_e32": (lambda a: float(a), lambda a: f"float({as_uint(a)})"),
+}
+FLOAT = {
+    "v_fma_f32": lambda a, b, c: f"mad({as_float(a)}, {as_float(b)}, {as_float(c)})",
+}
+
+
+class Expressions:
+    """Per-vertex values in creation order. Equal expressions share one variable."""
+
+    def __init__(self):
+        self.names = {}
+        self.entries = []
+
+    def add(self, kind, text, operands):
+        if (kind, text) not in self.names:
+            sym = Sym(f"t{len(self.entries)}", kind)
+            uses = {v for v in operands if isinstance(v, Sym) and v != VERTEX_ID}
+            self.names[kind, text] = sym
+            self.entries.append((sym, text, uses))
+        return self.names[kind, text]
+
+    def declarations(self, outputs):
+        needed = {v for v in outputs if isinstance(v, Sym)}
+        for sym, _, uses in reversed(self.entries):
+            if sym in needed:
+                needed |= uses
+        return [f"  {'precise float' if sym.kind == 'float' else 'uint'} {sym.name} = {text};"
+                for sym, text, _ in self.entries if sym in needed]
+
+
 def constant(token, width=32):
     """Bit pattern of an inline or literal constant at the operand width."""
     if token in FLOAT_INLINE and width == 32:
@@ -83,6 +155,7 @@ def subgroup(waves):
     7:0, GSPrimCount in bits 15:8, its index in bits 27:24 and the wave count in bits
     31:28. A primitive thread receives its three vertex indices packed ten bits apart
     in v0. Lanes without a primitive hold distinct values that no check accepts.
+    VertexID (v5) is the symbolic input of the translated shader in every lane.
     """
     vertices = sum(es for es, _ in waves)
     primitives = sum(gs for _, gs in waves)
@@ -101,8 +174,8 @@ def subgroup(waves):
                 expected[lane] = v0
             else:
                 v0 = 0xDEA00000 | index << 8 | lane
-            lanes.append({0: v0, 1: 0xB1000000 | index << 8 | lane})
-        result.append(({2: s2, 3: s3}, lanes, expected))
+            lanes.append({0: v0, 1: 0xB1000000 | index << 8 | lane, 5: VERTEX_ID})
+        result.append(({2: s2, 3: s3}, lanes, expected, es))
         first += gs
     return vertices, primitives, result
 
@@ -110,8 +183,9 @@ def subgroup(waves):
 class Wave:
     """One wave64 of a modeled subgroup with concrete control state."""
 
-    def __init__(self, index, sgprs, lanes):
+    def __init__(self, index, sgprs, lanes, expressions):
         self.index = index
+        self.e = expressions
         self.s = dict(sgprs)
         self.v = lanes
         self.exec = WAVE
@@ -188,26 +262,44 @@ class Wave:
                 mask |= VECTOR_COMPARE[op](x, y) << lane
             self.vcc = mask
             return
-        if op not in VECTOR_ALU:
+        if op != "v_mov_b32_e32" and not any(op in table for table in (VECTOR_ALU, INTEGER, CONVERT, FLOAT)):
             raise ValueError(f"Unsupported vertex instruction {op}")
         dest, *sources = args
         if not re.fullmatch(r"v\d+", dest):
             raise ValueError(f"Unsupported vector destination {dest}")
         for lane in self.live():
             values = [self.lane_value(t, lane) for t in sources]
-            if any(type(value) is not int for value in values):
+            self.v[lane][int(dest[1:])] = self.lane_result(op, lane, values)
+
+    def lane_result(self, op, lane, values):
+        if op == "v_mov_b32_e32":
+            return values[0]
+        concrete = all(type(value) is int for value in values)
+        if op in VECTOR_ALU:
+            if not concrete:
                 raise ValueError(f"Per-vertex operand of {op}")
-            self.v[lane][int(dest[1:])] = VECTOR_ALU[op](lane, *values)
+            return VECTOR_ALU[op](lane, *values)
+        if op in INTEGER:
+            fold, text = INTEGER[op]
+            return fold(*values) if concrete else self.e.add("uint", text(*values), values)
+        if op in CONVERT:
+            fold, text = CONVERT[op]
+            return f32_bits(fold(*values)) if concrete else self.e.add("float", text(*values), values)
+        return self.e.add("float", FLOAT[op](*values), values)
 
     def export(self, tail):
         m = EXPORT.fullmatch(tail)
         if not m:
             raise ValueError(f"Unsupported export {tail}")
         target, operands, flags = m[1], m.groups()[1:5], m[6].split()
-        if target != "prim":
+        if target == "prim":
+            if flags != ["done"] or operands[0] == "off" or operands[1:] != ("off",) * 3:
+                raise ValueError("Unsupported primitive export")
+        elif target == "pos0":
+            if flags != ["done"] or "off" in operands:
+                raise ValueError("Unsupported position export")
+        else:
             raise ValueError(f"Unsupported export {tail}")
-        if flags != ["done"] or operands[0] == "off" or operands[1:] != ("off",) * 3:
-            raise ValueError("Unsupported primitive export")
         if self.index == 0 and not self.allocations:
             raise ValueError("Export before allocation")
         lanes = self.exports.setdefault(target, {})
@@ -282,12 +374,12 @@ class Wave:
                 raise ValueError(f"Unsupported vertex instruction {op}")
 
 
-def check_subgroup(program, waves):
-    """Run one modeled subgroup and check its synchronization, allocation and primitives."""
+def check_subgroup(program, waves, expressions):
+    """Run one modeled subgroup and check its synchronization, allocation and export lanes."""
     vertices, primitives, entries = subgroup(waves)
     results = []
-    for index, (sgprs, lanes, expected) in enumerate(entries):
-        wave = Wave(index, sgprs, lanes)
+    for index, (sgprs, lanes, _, _) in enumerate(entries):
+        wave = Wave(index, sgprs, lanes, expressions)
         wave.run(program)
         results.append(wave)
     if any(wave.barriers != results[0].barriers for wave in results):
@@ -297,22 +389,48 @@ def check_subgroup(program, waves):
         raise ValueError("Expected one allocation from wave 0")
     if allocations[0][1] != vertices | primitives << 12:
         raise ValueError("Allocation differs from the subgroup's input counts")
-    for wave, (_, _, expected) in zip(results, entries):
+    for wave, (_, _, expected, wave_vertices) in zip(results, entries):
         primitive = wave.exports.get("prim", {})
         if primitive.keys() != expected.keys():
             raise ValueError("Primitive export lanes differ from the input primitives")
         if any(primitive[lane][0] != value for lane, value in expected.items()):
             raise ValueError("Primitive export differs from the input primitive")
+        if wave.exports.get("pos0", {}).keys() != set(range(wave_vertices)):
+            raise ValueError("Position export lanes differ from the input vertices")
     return results
+
+
+def float4(values):
+    return f"float4({', '.join('0.0f' if v is None else as_float(v) for v in values)})"
+
+
+def emit(expressions, position):
+    lines = [
+        "struct VertexOutput {",
+        "  float4 position : SV_Position;",
+        "};",
+        "",
+        "VertexOutput main(uint vertex_id : SV_VertexID) {",
+        *expressions.declarations(position),
+        "  VertexOutput result;",
+        f"  result.position = {float4(position)};",
+        "  return result;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def lower(program):
     """Return HLSL for a decoded NGG vertex program given as (byte offset, text) pairs."""
     if not program or program[-1][1] != "s_endpgm" or [line for _, line in program].count("s_endpgm") != 1:
         raise ValueError("Expected a single trailing s_endpgm")
-    for waves in SUBGROUPS:
-        check_subgroup(program, waves)
-    raise ValueError("Expected position exports")
+    expressions = Expressions()
+    waves = [wave for shape in SUBGROUPS for wave in check_subgroup(program, shape, expressions)]
+    # Every vertex thread of every subgroup must compute the same function of VertexID.
+    positions = {value for wave in waves for value in wave.exports["pos0"].values()}
+    if len(positions) != 1:
+        raise ValueError("Position depends on more than VertexID")
+    return emit(expressions, positions.pop())
 
 
 def translate(blob, library):
