@@ -12,8 +12,10 @@ namespace {
 std::vector<char> read_file(const char* path, const char* failure)
 {
     std::ifstream stream(path, std::ios::binary);
+    if (!stream) throw std::runtime_error(failure);
+    // istreambuf_iterator reads the buffer directly and leaves the stream's eofbit clear.
     std::vector<char> bytes{std::istreambuf_iterator<char>(stream), {}};
-    if (!stream.eof() || bytes.empty()) throw std::runtime_error(failure);
+    if (bytes.empty() || stream.bad()) throw std::runtime_error(failure);
     return bytes;
 }
 }
