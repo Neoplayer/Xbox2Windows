@@ -82,6 +82,7 @@ jobs:
           python -B tests/docs_links_check.py
           python -B tests/bidi_controls_check.py
           python -B tests/hardware_reports_check.py
+          python -B tests/vertex_aot_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
