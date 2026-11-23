@@ -2,7 +2,9 @@
 
 from pathlib import Path
 import re
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from vertex_aot import LAYOUTS, SUBGROUPS, Expressions, PrimitiveMismatch, check_subgroup, lower
@@ -305,5 +307,58 @@ def source():
     return FIXTURES
 
 
-if __name__ == "__main__":
+def assemble(program, assembler, objcopy, tmp):
+    source_file, obj, raw = (tmp / name for name in ("fixture.s", "fixture.o", "fixture.bin"))
+    source_file.write_text("\n".join(program) + "\n")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013",
+                    "-mattr=+wavefrontsize64,-wavefrontsize32", "-filetype=obj", source_file, "-o", obj],
+                   check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    return raw.read_bytes()
+
+
+def record(code, stage):
+    """A bounded FSSM record for the given stage, padded with s_code_end."""
+    from pixel_aot import _read_named_container
+    from pixel_aot_check import envelope
+
+    padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
+    blob = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)), stage=stage)
+    return _read_named_container(blob, len(b"fixture") + 2)
+
+
+def binary(assembler, objcopy, library):
+    from pixel_aot import disassemble
+    from vertex_aot import translate
+
     source()
+    tool = Path(__file__).resolve().parents[1] / "tools" / "vertex_aot.py"
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        for program, expected in FIXTURES:
+            code = assemble(program, assembler, objcopy, tmp)
+            listing = disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32")
+            if listing != decoded(program):
+                raise AssertionError(f"LLVM listing differs from the fixture source: {listing}")
+            container, output = tmp / "input.dxbc", tmp / "vertex.hlsl"
+            container.write_bytes(record(code, 1))
+            subprocess.run([sys.executable, "-B", tool, container, "--llvm", library, "--output", output],
+                           check=True)
+            if output.read_text() != expected:
+                raise AssertionError(f"Unexpected translated HLSL:\n{output.read_text()}")
+            # The same code in a pixel or mesh record is not a vertex program.
+            for stage in (0, 13):
+                try:
+                    translate(record(code, stage), library)
+                except ValueError as error:
+                    if "Unexpected shader stage" not in str(error):
+                        raise
+                else:
+                    raise AssertionError(f"Accepted a stage {stage} record")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["binary"]:
+        binary(*sys.argv[2:])
+    else:
+        source()

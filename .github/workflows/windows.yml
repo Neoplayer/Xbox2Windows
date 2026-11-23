@@ -36,6 +36,7 @@ jobs:
           python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/vertex_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_descriptor_swap_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_shadow_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1

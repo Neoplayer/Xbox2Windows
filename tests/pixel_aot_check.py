@@ -193,7 +193,7 @@ def shader_record(blob: bytes, name: bytes) -> bytes:
 
 
 def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None,
-             compute_width=None, mesh_limits=None) -> bytes:
+             compute_width=None, mesh_limits=None, stage=None) -> bytes:
     program_start = 288 if directory_end is not None else 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
@@ -208,6 +208,8 @@ def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | Non
                + struct.pack("<III", 13, 48, len(native)) + native)
     if compute_width is not None:
         program = program[:2] + struct.pack("<H", 13 if mesh_limits else 5) + program[4:]
+    elif stage is not None:
+        program = program[:2] + struct.pack("<H", stage) + program[4:]
     sections = [b"DXIL" + struct.pack("<I", len(program)) + program]
     if compute_width is not None:
         psv = bytearray(52)
