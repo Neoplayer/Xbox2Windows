@@ -1,7 +1,8 @@
-"""Translate source-built NGG vertex shaders and check their controls."""
+"""Translate source-built NGG vertex shaders, check their controls and draw them."""
 
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -357,8 +358,64 @@ def binary(assembler, objcopy, library):
                     raise AssertionError(f"Accepted a stage {stage} record")
 
 
+PIXEL = """struct VertexOutput {
+  float4 position : SV_Position;
+  float4 attr0 : TEXCOORD0;
+};
+
+float4 main(VertexOutput input) : SV_Target0 {
+  return input.attr0;
+}
+"""
+SIDE = 32
+
+
+def reference(transposed=False):
+    """RGBA32F texture coordinate at each pixel centre under the full-screen triangle."""
+    texels = bytearray()
+    for y in range(SIDE):
+        for x in range(SIDE):
+            u, v = (x + 0.5) / SIDE, (y + 0.5) / SIDE
+            texels += struct.pack("<4f", *((v, u) if transposed else (u, v)), 0.0, 1.0)
+    return bytes(texels)
+
+
+def draw(dxc, renderer, adapter):
+    fixtures = source()
+    # Swapping the parameter channels must transpose the image, and nothing else.
+    swapped = replace(PASS_THROUGH, "exp param0 v10, v11, v14, v15", "exp param0 v11, v10, v14, v15")
+    cases = [(hlsl, "reference.bin") for _, hlsl in fixtures]
+    cases.append((lower(decoded(swapped)), "transposed.bin"))
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        (tmp / "pixel.hlsl").write_text(PIXEL)
+        subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", tmp / "pixel.dxil", tmp / "pixel.hlsl"],
+                       check=True)
+        (tmp / "reference.bin").write_bytes(reference())
+        (tmp / "transposed.bin").write_bytes(reference(transposed=True))
+        for index, (hlsl, match) in enumerate(cases):
+            shader, compiled = tmp / f"vertex{index}.hlsl", tmp / f"vertex{index}.dxil"
+            shader.write_text(hlsl)
+            subprocess.run([dxc, "-T", "vs_6_0", "-E", "main", "-Fo", compiled, shader], check=True)
+            for name in ("reference.bin", "transposed.bin"):
+                result = subprocess.run([renderer, adapter, "--vertex-draw", compiled, tmp / "pixel.dxil", tmp / name],
+                                        capture_output=True, text=True)
+                print(f"vertex{index} {name}: {result.stdout.strip()}")
+                if result.returncode == 77:
+                    print(result.stderr, end="")
+                    return 77
+                if name == match and result.returncode != 0:
+                    raise AssertionError(f"vertex{index} differs from {name}: {result.stderr}")
+                if name != match and (result.returncode != 1
+                                      or "Vertex draw reference mismatch" not in result.stderr):
+                    raise AssertionError(f"vertex{index} unexpectedly matched {name}: {result.stderr}")
+    return 0
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["binary"]:
         binary(*sys.argv[2:])
+    elif sys.argv[1:]:
+        sys.exit(draw(*sys.argv[1:]))
     else:
         source()
