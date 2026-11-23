@@ -298,6 +298,9 @@ class Wave:
         elif target == "pos0":
             if flags != ["done"] or "off" in operands:
                 raise ValueError("Unsupported position export")
+        elif target.startswith("param") and int(target[5:]) < 32:
+            if flags or operands == ("off",) * 4:
+                raise ValueError("Unsupported parameter export")
         else:
             raise ValueError(f"Unsupported export {tail}")
         if self.index == 0 and not self.allocations:
@@ -404,16 +407,19 @@ def float4(values):
     return f"float4({', '.join('0.0f' if v is None else as_float(v) for v in values)})"
 
 
-def emit(expressions, position):
+def emit(expressions, position, parameters):
+    """PARAM k becomes TEXCOORD k, the input slot a translated pixel shader reads for attribute k."""
     lines = [
         "struct VertexOutput {",
         "  float4 position : SV_Position;",
+        *(f"  float4 attr{k} : TEXCOORD{k};" for k in parameters),
         "};",
         "",
         "VertexOutput main(uint vertex_id : SV_VertexID) {",
-        *expressions.declarations(position),
+        *expressions.declarations([*position, *(v for values in parameters.values() for v in values)]),
         "  VertexOutput result;",
         f"  result.position = {float4(position)};",
+        *(f"  result.attr{k} = {float4(values)};" for k, values in parameters.items()),
         "  return result;",
         "}",
     ]
@@ -430,7 +436,16 @@ def lower(program):
     positions = {value for wave in waves for value in wave.exports["pos0"].values()}
     if len(positions) != 1:
         raise ValueError("Position depends on more than VertexID")
-    return emit(expressions, positions.pop())
+    targets = {target for wave in waves for target in wave.exports if target.startswith("param")}
+    parameters = {}
+    for k in sorted(int(target[5:]) for target in targets):
+        if any(wave.exports.get(f"param{k}", {}).keys() != wave.exports["pos0"].keys() for wave in waves):
+            raise ValueError(f"param{k} export lanes differ from the input vertices")
+        values = {value for wave in waves for value in wave.exports[f"param{k}"].values()}
+        if len(values) != 1:
+            raise ValueError(f"param{k} depends on more than VertexID")
+        parameters[k] = values.pop()
+    return emit(expressions, positions.pop(), parameters)
 
 
 def translate(blob, library):

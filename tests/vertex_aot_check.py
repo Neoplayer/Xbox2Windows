@@ -45,9 +45,11 @@ VERTEX = [
     "v_mov_b32_e32 v14, 0",
     "v_mov_b32_e32 v15, 1.0",
     "exp pos0 v12, v13, v14, v15 done",
+    "exp param0 v10, v11, v14, v15",
 ]
-POSITION_HLSL = """struct VertexOutput {
+FULLSCREEN_HLSL = """struct VertexOutput {
   float4 position : SV_Position;
+  float4 attr0 : TEXCOORD0;
 };
 
 VertexOutput main(uint vertex_id : SV_VertexID) {
@@ -60,6 +62,7 @@ VertexOutput main(uint vertex_id : SV_VertexID) {
   precise float t6 = mad(t4, asfloat(0xc0000000u), asfloat(0x3f800000u));
   VertexOutput result;
   result.position = float4(t5, t6, asfloat(0x00000000u), asfloat(0x3f800000u));
+  result.attr0 = float4(t3, t4, asfloat(0x00000000u), asfloat(0x3f800000u));
   return result;
 }
 """
@@ -164,7 +167,7 @@ def position_controls():
     expect_error(replace(program, export, "exp pos0 v12, v13, v14, v15"), "Unsupported position export")
     expect_error(replace(program, export, "exp pos0 v12, v13, off, v15 done"), "Unsupported position export")
     expect_error(replace(program, export, "exp pos1 v12, v13, v14, v15 done"), "Unsupported export")
-    expect_error(program[:-1] + [export, "s_endpgm"], "Repeated pos0 export")
+    expect_error(program[:-2] + [export] + program[-2:], "Repeated pos0 export")
     expect_error(replace(program, "v_mov_b32_e32 v14, 0", "v_cmp_gt_u32_e32 vcc, 2, v5"),
                  "Per-vertex value in a predicate")
     expect_error(replace(program, "v_mov_b32_e32 v14, 0", "v_mbcnt_lo_u32_b32 v14, v5, 0"),
@@ -173,12 +176,29 @@ def position_controls():
                  "Unsupported vertex instruction v_xor_b32_e32")
 
 
+def parameter_controls():
+    program = PROLOGUE + PRIMITIVE + VERTEX + ["s_endpgm"]
+    export = "exp param0 v10, v11, v14, v15"
+    partial = lower(decoded(replace(program, export, "exp param3 v10, off, v11, off")))
+    if "  result.attr3 = float4(t3, 0.0f, t4, 0.0f);\n" not in partial or "TEXCOORD3;" not in partial:
+        raise AssertionError(f"Unexpected partial parameter:\n{partial}")
+    expect_error(replace(program, export, "exp param0 v9, v11, v14, v15"), "param0 depends on more than VertexID")
+    narrowed = ["v_cmp_gt_u32_e32 vcc, 2, v9", "s_and_saveexec_b64 s[8:9], vcc"]
+    expect_error(program[:-2] + narrowed + program[-2:], "param0 export lanes differ from the input vertices")
+    expect_error(program[:-2] + ["s_mov_b64 exec, -1"] + program[-2:], "Read of undefined vector register v10")
+    expect_error(replace(program, export, "exp param0 v10, v11, v14, v15 done"), "Unsupported parameter export")
+    expect_error(replace(program, export, "exp param0 off, off, off, off"), "Unsupported parameter export")
+    expect_error(replace(program, export, "exp param32 v10, v11, v14, v15"), "Unsupported export")
+    expect_error(program[:-1] + [export, "s_endpgm"], "Repeated param0 export")
+
+
 def source():
     prologue_controls()
     primitive_controls()
     position_controls()
+    parameter_controls()
     translated = lower(decoded(PROLOGUE + PRIMITIVE + VERTEX + ["s_endpgm"]))
-    if translated != POSITION_HLSL:
+    if translated != FULLSCREEN_HLSL:
         raise AssertionError(f"Unexpected HLSL:\n{translated}")
     return translated
 
