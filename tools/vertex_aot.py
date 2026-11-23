@@ -41,6 +41,15 @@ SCALAR_COMPARE = {
     "s_cmp_eq_u32": lambda a, b: a == b,
     "s_cmp_lg_u32": lambda a, b: a != b,
 }
+# Lane-wise integer operations with concrete operands.
+VECTOR_ALU = {
+    "v_mbcnt_lo_u32_b32": lambda lane, a, b: (a & (1 << min(lane, 32)) - 1).bit_count() + b & U32,
+    "v_mbcnt_hi_u32_b32": lambda lane, a, b: (a & (1 << max(lane - 32, 0)) - 1).bit_count() + b & U32,
+}
+VECTOR_COMPARE = {
+    "v_cmp_gt_u32_e32": lambda a, b: a > b,
+}
+EXPORT = re.compile(r"(prim|pos0|param\d+) (v\d+|off), (v\d+|off), (v\d+|off), (v\d+|off)((?: [a-z]+)*)")
 FLOAT_INLINE = {
     "0.5": 0x3F000000, "-0.5": 0xBF000000, "1.0": 0x3F800000, "-1.0": 0xBF800000,
     "2.0": 0x40000000, "-2.0": 0xC0000000, "4.0": 0x40800000, "-4.0": 0xC0800000,
@@ -111,6 +120,7 @@ class Wave:
         self.m0 = None
         self.barriers = []
         self.allocations = []
+        self.exports = {}
 
     def sgpr(self, i):
         if i not in self.s:
@@ -154,6 +164,57 @@ class Wave:
             self.s[int(dest[1:])] = value & U32
         else:
             raise ValueError(f"Unsupported scalar destination {dest}")
+
+    def lane_value(self, token, lane):
+        if m := re.fullmatch(r"v(\d+)", token):
+            if int(m[1]) not in self.v[lane]:
+                raise ValueError(f"Read of undefined vector register {token}")
+            return self.v[lane][int(m[1])]
+        return self.scalar(token)
+
+    def live(self):
+        return [lane for lane in range(64) if self.exec >> lane & 1]
+
+    def vector_op(self, op, args):
+        if op in VECTOR_COMPARE:
+            dest, a, b = args
+            if dest != "vcc":
+                raise ValueError(f"Unsupported comparison destination {dest}")
+            mask = 0
+            for lane in self.live():
+                x, y = self.lane_value(a, lane), self.lane_value(b, lane)
+                if type(x) is not int or type(y) is not int:
+                    raise ValueError("Per-vertex value in a predicate")
+                mask |= VECTOR_COMPARE[op](x, y) << lane
+            self.vcc = mask
+            return
+        if op not in VECTOR_ALU:
+            raise ValueError(f"Unsupported vertex instruction {op}")
+        dest, *sources = args
+        if not re.fullmatch(r"v\d+", dest):
+            raise ValueError(f"Unsupported vector destination {dest}")
+        for lane in self.live():
+            values = [self.lane_value(t, lane) for t in sources]
+            if any(type(value) is not int for value in values):
+                raise ValueError(f"Per-vertex operand of {op}")
+            self.v[lane][int(dest[1:])] = VECTOR_ALU[op](lane, *values)
+
+    def export(self, tail):
+        m = EXPORT.fullmatch(tail)
+        if not m:
+            raise ValueError(f"Unsupported export {tail}")
+        target, operands, flags = m[1], m.groups()[1:5], m[6].split()
+        if target != "prim":
+            raise ValueError(f"Unsupported export {tail}")
+        if flags != ["done"] or operands[0] == "off" or operands[1:] != ("off",) * 3:
+            raise ValueError("Unsupported primitive export")
+        if self.index == 0 and not self.allocations:
+            raise ValueError("Export before allocation")
+        lanes = self.exports.setdefault(target, {})
+        for lane in self.live():
+            if lane in lanes:
+                raise ValueError(f"Repeated {target} export")
+            lanes[lane] = tuple(None if t == "off" else self.lane_value(t, lane) for t in operands)
 
     def scalar_op(self, op, args):
         if op in SCALAR_COMPARE:
@@ -211,14 +272,18 @@ class Wave:
                 target = self.branch(op, pc, tail, index)
                 if target is not None:
                     i = target
+            elif op == "exp":
+                self.export(tail)
             elif op.startswith("s_"):
                 self.scalar_op(op, args)
+            elif op.startswith("v_"):
+                self.vector_op(op, args)
             else:
                 raise ValueError(f"Unsupported vertex instruction {op}")
 
 
 def check_subgroup(program, waves):
-    """Run one modeled subgroup and check its synchronization and allocation."""
+    """Run one modeled subgroup and check its synchronization, allocation and primitives."""
     vertices, primitives, entries = subgroup(waves)
     results = []
     for index, (sgprs, lanes, expected) in enumerate(entries):
@@ -232,6 +297,12 @@ def check_subgroup(program, waves):
         raise ValueError("Expected one allocation from wave 0")
     if allocations[0][1] != vertices | primitives << 12:
         raise ValueError("Allocation differs from the subgroup's input counts")
+    for wave, (_, _, expected) in zip(results, entries):
+        primitive = wave.exports.get("prim", {})
+        if primitive.keys() != expected.keys():
+            raise ValueError("Primitive export lanes differ from the input primitives")
+        if any(primitive[lane][0] != value for lane, value in expected.items()):
+            raise ValueError("Primitive export differs from the input primitive")
     return results
 
 
