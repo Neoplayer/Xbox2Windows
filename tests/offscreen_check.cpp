@@ -734,6 +734,12 @@ OperationResult run_mesh_depth_pair_fallback(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_vertex_draw(const OperationContext& ctx)
+{
+    check_vertex_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_shadow(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_shadow_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6],
@@ -998,6 +1004,8 @@ const OperationSpec kOperations[] = {
     {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
     {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
+    // <vs> <ps> <reference>: three vertices without an input layout, RGBA32F readback.
+    {"--vertex-draw", 6, 6, nullptr, kNoGate, run_vertex_draw},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
     {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
@@ -1219,6 +1227,8 @@ int run_self_test()
     if (!check_cli({"offscreen_check", "warp", "--compute-mesh-texture", "a", "b", "c", "d", "e", "--bad"},
                    CliAction::usage_error, "Unknown GPU operation or invalid arguments: --compute-mesh-texture"))
         return 1;
+    if (!check_cli({"offscreen_check", "warp", "--vertex-draw", "vs", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --vertex-draw")) return 1;
     if (!check_cli({"offscreen_check", "warp", "out.bmp", "vs.cso"}, CliAction::usage_error)) return 1;
     if (!check_cli({"offscreen_check", "invalid_backend", "--dual-uav"}, CliAction::usage_error)) return 1;
     if (!check_cli({"offscreen_check", "warp", "out.bmp"}, CliAction::draw)) return 1;

@@ -204,6 +204,7 @@ add_custom_command(OUTPUT "${pixel_vs_linear}" COMMAND "${DXC_EXECUTABLE}" -T vs
 target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}"
     "${pixel_vs_linear}")
 target_sources(offscreen_check PRIVATE tests/desktop_gpu.cpp tests/mesh_entry_draw.cpp tests/mesh_shadow_draw.cpp)
+target_sources(offscreen_check PRIVATE tests/vertex_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)

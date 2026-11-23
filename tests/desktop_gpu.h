@@ -37,6 +37,7 @@ void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const c
                               const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
                               const MeshTextureProducers* = nullptr);
 void check_texture_mips(ID3D12Device* device);
+void check_vertex_draw(ID3D12Device* device, const char* vertex, const char* pixel, const char* reference);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
